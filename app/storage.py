@@ -5,6 +5,12 @@
 ``version == expected_version`` 做乐观锁校验：过期返回 ``StaleVersion``；
 确认已确认样本返回 ``AlreadyConfirmed``。版本仅在提交成功后加 1，
 任何失败（含计算失败）都不会留下中间状态。
+
+读取同样包在单个只读事务（``BEGIN`` … ``COMMIT``/``ROLLBACK``）内：
+WAL 下读事务持有开始时刻的快照，期间其他连接仍可合法提交写入，因此
+一次读取返回的版本、blank、样本输入/顺序/结果与确认状态必然来自同一
+完整提交——读写交错时只会见到完整旧状态或完整新状态，绝不拼接。
+无论读成功、批次不存在还是中途异常，事务都结束、连接都关闭。
 """
 
 from __future__ import annotations
@@ -76,7 +82,12 @@ def canonical_result(result: dict[str, Any]) -> list[tuple]:
 
 
 class BatchStore:
-    """SQLite 批次存储；进程内一把锁串行化写事务（配合 BEGIN IMMEDIATE）。"""
+    """SQLite 批次存储。
+
+    写事务：进程锁 + BEGIN IMMEDIATE 全局串行，杜绝跨事务覆盖。
+    读事务：单条 BEGIN 包住整次读取，WAL 快照隔离保证读到同一完整提交；
+    读不取进程锁，不阻塞其他连接的合法写入。
+    """
 
     def __init__(self, path: str):
         self.path = path
@@ -109,12 +120,31 @@ class BatchStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """BEGIN 包住整次读取：事务内所有 SELECT 看到同一已提交快照。
+
+        WAL 下读事务持有开始时刻的快照，期间其他连接仍可合法提交写入，
+        本事务不受其影响（也不取进程锁）。正常结束 COMMIT，异常
+        （含批次不存在）ROLLBACK，连接由 ``_connect`` 保证关闭。
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
     # ------------------------------------------------------------------
     # 读
     # ------------------------------------------------------------------
 
     def get(self, batch_id: str) -> dict[str, Any]:
-        with self._connect() as conn:
+        # 两条 SELECT 在同一读事务内：版本/blank 与样本必然来自同一完整提交，
+        # 即使另一连接在两次 SELECT 之间提交了新版本。
+        with self._read_transaction() as conn:
             row = conn.execute(
                 "SELECT version, params, blank FROM batches WHERE batch_id = ?",
                 (batch_id,),

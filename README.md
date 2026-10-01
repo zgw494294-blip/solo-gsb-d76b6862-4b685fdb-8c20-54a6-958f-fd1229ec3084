@@ -666,10 +666,23 @@ BID=$(curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
 ### `GET /v1/blank-subtraction-batches/{batch_id}`（读取）
 
 返回批次的完整当前状态（结构同创建响应）。批次不存在返回 **404**。
-只读已提交数据，不会见到创建/重算过程中的半成品状态。
+
+读取在**单个只读事务**内完成（SQLite WAL 快照隔离）：响应中的 `version`、
+`blank`、各样本的 `input`/顺序/`result`/`confirmed` 必然来自**同一次完整提交**。
+即使读取期间另一连接以 `expected_version` 合法提交了确认或换 blank，
+本次响应也只会是**完整旧状态或完整新状态**，绝不把两个版本的字段拼接在一起；
+读取不取写锁、不阻塞并发写入，写事务的乐观锁规则不受影响。
 
 ```bash
 curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID | jq '.version, [.samples[] | {id, confirmed}]'
+
+# 确认后再读：version 与 confirmed 来自同一次提交，同步前进
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "run-01", "expected_version": 1}'
+curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID |
+  jq '{version, confirmed: [.samples[].confirmed]}'
+# => {"version":2,"confirmed":[true,false]}
 ```
 
 ### `POST .../{batch_id}/confirm`（确认单个样本）
@@ -762,7 +775,9 @@ pytest -q
 与独立浮点参照实现对拍，并含积分 → 归属 / 定量的端到端衔接测试。
 可复核批次测试覆盖创建/读取/确认/换 blank 重算的完整生命周期、422/404/409 各分支、
 “失败不留批次/不改状态”、同版本并发确认与替换的竞争（仅一项成功），
-以及用同一 SQLite 文件重开存储模拟容器重启后的持久化读取。
+用同一 SQLite 文件重开存储模拟容器重启后的持久化读取，
+以及读写交错回归测试：读取在批次行后暂停、另一连接合法提交新版本再放行，
+断言响应只含完整旧状态或完整新状态，且读成功/404/中途异常都结束事务并关闭连接。
 
 ## 目录结构
 
