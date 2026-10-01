@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
 from pathlib import Path
@@ -456,6 +457,166 @@ def test_concurrent_confirm_and_replace_same_version_only_one_succeeds():
             {"ref_id": "A", "corrected_area": {"n": 3, "d": 2}},
             {"ref_id": "B", "corrected_area": {"n": 4, "d": 1}},
         ]
+
+
+# ---------------------------------------------------------------------------
+# 读写交错：GET 必须读到同一完整提交（快照隔离回归）
+# ---------------------------------------------------------------------------
+
+class _InterleaveProxy:
+    """包装 SQLite 连接：命中语句执行完后触发回调（模拟另一连接的并发写）。"""
+
+    def __init__(self, conn, hook):
+        self._conn = conn
+        self._hook = hook
+
+    def execute(self, sql, parameters=()):
+        cur = self._conn.execute(sql, parameters)
+        self._hook(sql)
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _patch_interleave(monkeypatch, store, marker, on_hit):
+    """让 store 的连接在首次执行含 marker 的 SQL 后调用 on_hit（仅一次）。
+
+    由此把一次“另一连接的合法写入”精确插在 GET 读批次行与读样本行之间，
+    复现 WAL 下读事务被挂起、另一连接完成提交的交错时序。
+    """
+    fired = False
+
+    def hook(sql):
+        nonlocal fired
+        if not fired and marker in sql:
+            fired = True
+            on_hit()
+
+    orig = store._connect
+
+    @contextlib.contextmanager
+    def patched():
+        with orig() as conn:
+            yield _InterleaveProxy(conn, hook)
+
+    monkeypatch.setattr(store, "_connect", patched)
+
+
+def test_get_interleaved_with_replace_blank_reads_one_consistent_commit(monkeypatch):
+    d = create()
+    bid = d["batch_id"]
+    before = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert before["version"] == 1
+    store = batches.get_store()
+
+    def concurrent_replace():
+        # 另一连接此时以 expected_version=1 合法替换 blank 并提交版本 2
+        r = batches.replace_blank(
+            bid, {"blank": run(*BLANK_STRONG), "expected_version": 1}
+        )
+        assert r["version"] == 2
+
+    # GET 读到版本 1 与旧 blank（第一条 SELECT）后、读样本前插入上述提交
+    _patch_interleave(monkeypatch, store, "FROM batches ", concurrent_replace)
+
+    r = client.get(f"/v1/blank-subtraction-batches/{bid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 必须返回同一完整提交：此处为完整旧状态（版本 1 + 旧 blank + 旧结果），
+    # 绝不拼出“旧版本/旧 blank + 新结果”
+    assert body == before
+    assert body["blank"]["samples"][1]["intensity"] == 2
+    assert body["samples"][0]["result"]["sample_peaks"] == [
+        {"ref_id": "A", "corrected_area": {"n": 3, "d": 2}},
+        {"ref_id": "B", "corrected_area": {"n": 4, "d": 1}},
+    ]
+    # 读不阻塞写：并发提交确实生效，之后读到完整新状态
+    after = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert after["version"] == 2
+    assert after["blank"]["samples"][1]["intensity"] == 6
+    assert after["samples"][0]["result"]["sample_peaks"][0][
+        "corrected_area"
+    ] == {"n": 0, "d": 1}
+
+
+def test_get_interleaved_with_confirm_keeps_version_and_flags_consistent(
+    monkeypatch,
+):
+    d = create()
+    bid = d["batch_id"]
+    store = batches.get_store()
+
+    def concurrent_confirm():
+        # 另一连接此时确认 s1 并提交版本 2
+        r = batches.confirm_sample(bid, "s1", 1)
+        assert r["version"] == 2
+
+    _patch_interleave(monkeypatch, store, "FROM batches ", concurrent_confirm)
+
+    body = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    # 版本与 confirmed 来自同一提交：完整 v1（全未确认），
+    # 不得出现“版本 1 但 s1 已确认”的错配
+    assert body["version"] == 1
+    assert [s["confirmed"] for s in body["samples"]] == [False, False]
+
+    after = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert after["version"] == 2
+    assert [s["confirmed"] for s in after["samples"]] == [True, False]
+
+
+def test_get_snapshot_isolation_does_not_rely_on_single_instance_lock(
+    isolated_db, monkeypatch
+):
+    # 写入来自另一个 BatchStore 实例（另一把进程锁、同一数据库文件）：
+    # 单实例锁无法串行化这次交错，一致性只能由 SQLite 快照隔离保证。
+    d = create()
+    bid = d["batch_id"]
+    store = batches.get_store()
+    other = BatchStore(isolated_db)
+
+    def concurrent_confirm():
+        r = other.confirm(bid, "s1", 1)
+        assert r["version"] == 2
+
+    _patch_interleave(monkeypatch, store, "FROM batches ", concurrent_confirm)
+
+    body = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert body["version"] == 1
+    assert [s["confirmed"] for s in body["samples"]] == [False, False]
+
+    after = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert after["version"] == 2
+    assert [s["confirmed"] for s in after["samples"]] == [True, False]
+
+
+def test_read_releases_transaction_and_connection_on_404_and_mid_read_error(
+    monkeypatch,
+):
+    d = create()
+    bid = d["batch_id"]
+    store = batches.get_store()
+
+    # 不存在的批次：404 之后事务与连接已释放，后续读写不受影响
+    assert client.get("/v1/blank-subtraction-batches/nope").status_code == 404
+
+    # 读样本中途抛错：事务与连接同样必须释放
+    def boom():
+        raise sqlite3.OperationalError("simulated mid-read failure")
+
+    _patch_interleave(monkeypatch, store, "FROM batch_samples", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        client.get(f"/v1/blank-subtraction-batches/{bid}")
+
+    # 异常没有留下占用：正常读取与乐观锁写入照常工作
+    body = client.get(f"/v1/blank-subtraction-batches/{bid}").json()
+    assert body["version"] == 1
+    r = client.post(
+        f"/v1/blank-subtraction-batches/{bid}/confirm",
+        json={"sample_id": "s1", "expected_version": 1},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == 2
 
 
 # ---------------------------------------------------------------------------

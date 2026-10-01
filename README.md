@@ -571,6 +571,12 @@ echo "$RESP" | jq '. as $r | {
 - 修改请求必须携带 `expected_version`；与当前版本不一致（过期）返回 **409**。
 - 同版本的并发确认/替换在数据库层串行化，**只有一项成功**（另一项 409），
   不会覆盖确认也不会出现“确认与换空白混用”的中间状态。
+- 读取（GET）在**单个 SQLite 读事务**内完成（WAL 快照隔离）：一次响应中的 `version`、
+  `blank`、各样本的 `input`、顺序、`result` 与 `confirmed` 必然来自**同一次完整提交**。
+  与写入交错时只会读到**完整旧状态或完整新状态**，绝不跨提交拼接
+  （例如不会出现“旧版本/旧 blank 配新结果”或“旧版本配新确认状态”）；
+  该保证不依赖进程内锁——读事务不阻塞其他连接的合法写入，写入提交后读事务仍只见
+  自己开始时的快照。读成功、批次不存在或中途异常都会释放事务与连接。
 - 任何失败（422/409/404）都保持输入、结果、确认状态与版本不变；读取只会见到完整已提交状态；
   创建失败不会留下批次。
 
@@ -668,8 +674,36 @@ BID=$(curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
 返回批次的完整当前状态（结构同创建响应）。批次不存在返回 **404**。
 只读已提交数据，不会见到创建/重算过程中的半成品状态。
 
+**读取语义（快照一致性）**：整个响应取自**同一个已提交版本**——`version`、`blank`、
+各样本的 `input`、排列顺序、`result` 与 `confirmed` 一定互相匹配。若读取与确认/
+换空白等写入并发，响应要么是写入前的完整旧状态，要么是写入后的完整新状态，
+绝不会把两次提交的内容拼在一起（例如旧 `version` 不会配上新 `result` 或新
+`confirmed`）。读取不阻塞写入，写入也不阻塞读取。
+
 ```bash
 curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID | jq '.version, [.samples[] | {id, confirmed}]'
+```
+
+可执行的一致性检查——同一响应内 `version` 与确认状态必然同属一次提交；
+确认后再读，两者一起前进（下例先确认 `run-01` 再读）：
+
+```bash
+# 确认前：版本 1，全部未确认
+curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID \
+  | jq '{version, confirmed: [.samples[].confirmed]}'
+# => {"version": 1, "confirmed": [false, false]}
+
+# 确认 run-01（携带当前版本），成功则版本 +1
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "run-01", "expected_version": 1}' \
+  | jq '{version, confirmed: [.samples[].confirmed]}'
+# => {"version": 2, "confirmed": [true, false]}
+
+# 再读：版本与确认状态来自同一次提交（此处为版本 2 的完整状态）
+curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID \
+  | jq '{version, confirmed: [.samples[].confirmed]}'
+# => {"version": 2, "confirmed": [true, false]}
 ```
 
 ### `POST .../{batch_id}/confirm`（确认单个样本）

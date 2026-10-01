@@ -5,6 +5,14 @@
 ``version == expected_version`` 做乐观锁校验：过期返回 ``StaleVersion``；
 确认已确认样本返回 ``AlreadyConfirmed``。版本仅在提交成功后加 1，
 任何失败（含计算失败）都不会留下中间状态。
+
+读取（``get``）同样在**单个显式读事务**内完成：WAL 模式下事务内所有
+语句看到同一快照，因此返回的版本、blank、样本输入、顺序、结果与确认
+状态必然来自同一次完整提交——读写交错时读到完整旧状态或完整新状态，
+绝不跨提交拼接。该保证来自 SQLite 快照隔离而非进程锁：读事务不阻塞
+其他连接的合法写入，写入提交后本读事务仍只见自己开始时的快照。
+无论读成功、批次不存在还是中途异常，事务（ROLLBACK）与连接（close）
+都在 finally 中释放。
 """
 
 from __future__ import annotations
@@ -109,12 +117,31 @@ class BatchStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """显式读事务：WAL 下事务内全部语句共享同一快照。
+
+        不取进程锁——快照隔离由 SQLite 保证，其他连接（含其他存储实例）
+        的合法写入可照常提交，本事务只见自己开始时的完整状态。
+        无论正常返回还是中途异常，都在 finally 中 ROLLBACK 释放快照，
+        连接由 ``_connect`` 关闭。
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                # 只读事务的 ROLLBACK 与 COMMIT 等价，均能释放快照；
+                # 成功、BatchNotFound、中途异常都走到这里。
+                conn.execute("ROLLBACK")
+
     # ------------------------------------------------------------------
     # 读
     # ------------------------------------------------------------------
 
     def get(self, batch_id: str) -> dict[str, Any]:
-        with self._connect() as conn:
+        """读取批次完整状态；全部字段来自同一次提交（见 ``_read_transaction``）。"""
+        with self._read_transaction() as conn:
             row = conn.execute(
                 "SELECT version, params, blank FROM batches WHERE batch_id = ?",
                 (batch_id,),
